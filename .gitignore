@@ -1,0 +1,15 @@
+# Local configuration - never commit credentials
+.env
+
+# Token cache - always secrets, never commit
+*.token.json
+token.local.json
+
+# PowerShell
+[Oo]bj/
+*.user
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
