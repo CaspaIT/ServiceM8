@@ -2,12 +2,12 @@
 
 A PowerShell wrapper for the [ServiceM8 REST API](https://developer.servicem8.com/docs/rest-overview).
 
-It handles OAuth 2.0 authentication and exposes ServiceM8 resources (jobs, companies, clients, materials, ...) as typed cmdlets.
+It handles single-token (X-API-Key) authentication and exposes ServiceM8 resources (jobs, companies, clients, materials, ...) as typed cmdlets.
 
 ## Requirements
 
 - PowerShell 7.0 or later
-- A registered ServiceM8 [Public Application](https://developer.servicem8.com/docs/authentication) (App ID + App Secret)
+- A ServiceM8 API token (see [authentication](https://developer.servicem8.com/docs/authentication))
 
 ## Installation
 
@@ -19,31 +19,34 @@ Or add it to your PowerShell profile.
 
 ## Configuration
 
-1. Register a Public Application in the ServiceM8 Developer Directory to get an **App ID** and **App Secret**.
-2. Set the application's redirect URI to `http://127.0.0.1:9177/oauth/callback`.
-3. Create a local config file:
+1. Create a local config file:
 
 ```powershell
 Copy-Item .env.example .env
-# then edit .env and fill in your client credentials
+# then edit .env and fill in your token
 ```
 
-`.env` is gitignored — never commit it.
+`.env` is gitignored — never commit it. Set your token in it:
+
+```
+SERVICE_M8_TOKEN=your-api-token
+```
+
+You can also export `SERVICE_M8_TOKEN` from your shell instead of using `.env`.
 
 ## Authentication
 
 ```powershell
 Import-Sm8Config            # loads .env (done automatically on first use)
 
-Connect-Sm8Client -Scopes 'read_jobs read_customers manage_jobs'
+Connect-Sm8Client           # validates & caches the token
 ```
 
-`Connect-Sm8Client` opens a browser for you to consent, starts a brief local
-listener to capture the OAuth callback, exchanges the code for a token pair, and
-stores the tokens in `~/.serviceM8.token.json` (gitignored). The access token is
-refreshed automatically via the refresh token when it nears expiry.
+With single-token auth there is no OAuth flow: the token you supply is sent as
+an `X-API-Key` header on every call. `Connect-Sm8Client`
+persists the token to `~/.serviceM8.token.json` (gitignored). Reload it later
+with `Get-Sm8Token`.
 
-Reuse an existing session with `Get-Sm8Token`.
 
 ## Usage
 
@@ -79,11 +82,11 @@ Invoke-Sm8Request -Path 'jobs' -Method GET
 Invoke-Sm8List -Path 'jobs'
 ```
 
-### OAuth scopes
+### Scopes
 
-Each resource requires specific scopes (e.g. `read_jobs`, `manage_jobs`).
-Request only the scopes your use case needs. See the ServiceM8 docs for the
-full list: <https://developer.servicem8.com/reference/listjobs.md>.
+Each resource requires a specific ServiceM8 scope (e.g. `read_jobs`, `manage_jobs`).
+The token must have been issued with the scopes your use case needs. See the
+ServiceM8 docs for the full list: <https://developer.servicem8.com/reference/listjobs.md>.
 
 ## Module layout
 
@@ -92,7 +95,7 @@ ServiceM8/
 ├── ServiceM8.psd1            # module manifest
 ├── ServiceM8.psm1            # loader (dot-sources src/)
 ├── src/
-│   ├── ServiceM8.Engine.psm1 # config, OAuth, token store, invoke, pagination
+│   ├── ServiceM8.Engine.psm1 # config, api-key auth, token store, invoke, pagination
 │   └── ServiceM8.Cmdlets.psm1# typed resource cmdlets
 └── tests/
     └── ServiceM8.Tests.ps1   # Pester tests

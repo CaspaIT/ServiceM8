@@ -8,6 +8,7 @@
 $script:ModuleRoot = $PSScriptRoot
 $script:ModuleSrc = Join-Path $PSScriptRoot 'src'
 
-# Import every engine/cmdlet module in src/.
+# Import every engine/cmdlet/registry module in src/.
+Import-Module (Join-Path $script:ModuleSrc 'ServiceM8.Registry.psm1') -Force
 Import-Module (Join-Path $script:ModuleSrc 'ServiceM8.Engine.psm1') -Force
 Import-Module (Join-Path $script:ModuleSrc 'ServiceM8.Cmdlets.psm1') -Force

@@ -34,7 +34,22 @@ Describe 'Module structure' {
 }
 
 Describe 'Connect-Sm8Client' {
-    It 'requires scopes' {
-        { Connect-Sm8Client } | Should -Throw -ExpectedMessage '*Scopes must be supplied*'
+    It 'throws when no token is available' {
+        # Temporarily move .env aside so config has no token to load, then
+        # restore it regardless of the outcome.
+        $envPath = Join-Path (Get-Location) '.env'
+        $backup = $envPath + '.pester-backup'
+        $moved = $false
+        if (Test-Path -LiteralPath $envPath) {
+            Move-Item -LiteralPath $envPath -Destination $backup -Force
+            $moved = $true
+        }
+        try {
+            { Connect-Sm8Client } | Should -Throw
+        } finally {
+            if ($moved) {
+                Move-Item -LiteralPath $backup -Destination $envPath -Force
+            }
+        }
     }
 }

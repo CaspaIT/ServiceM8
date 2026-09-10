@@ -3,10 +3,12 @@
     Core engine for the ServiceM8 REST API wrapper.
 
     Responsibilities:
-      - Loading client credentials from a .env file.
-      - Running the OAuth 2.0 authorization_code flow and persisting tokens.
-      - Injecting the bearer token, handling refresh, and making HTTP calls.
+      - Loading the API token from a .env file.
+      - Injecting the bearer token and making HTTP calls.
       - Walking cursor-based pagination.
+
+    Authentication is a single API key sent as an "X-API-Key" header,
+    no OAuth flow. See https://developer.servicem8.com/docs/rest-overview
 #>
 
 Set-StrictMode -Version Latest
@@ -22,15 +24,8 @@ $Script:Sm8Config = $null
 # Path to the token cache file (kept outside the repo by default).
 $Script:TokenPath = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.serviceM8.token.json'
 
-# OAuth configuration. Redirect URI must match the one registered with the
-# ServiceM8 Public Application.
-$Script:RedirectUri = 'http://127.0.0.1:9177/oauth/callback'
-$Script:AuthorizeUrl = 'https://go.servicem8.com/oauth/authorize'
-$Script:AccessTokenUrl = 'https://go.servicem8.com/oauth/access_token'
+# API configuration.
 $Script:ApiRoot = 'https://api.servicem8.com/api_1.0'
-
-# Minimum skew before an access token is considered expired (seconds).
-$Script:TokenRefreshBuffer = 60
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -39,10 +34,11 @@ $Script:TokenRefreshBuffer = 60
 function Import-Sm8Config {
     <#
     .SYNOPSIS
-        Load ServiceM8 client credentials from a .env file.
+        Load the ServiceM8 API token from a .env file.
     .DESCRIPTION
-        Reads NAME=VALUE pairs from the .env file into module state. Called
-        automatically by Connect-Sm8Client if no config has been loaded.
+        Reads NAME=VALUE pairs from the .env file into module state. The single
+        bearer token is read from SERVICE_M8_TOKEN. Called automatically by
+        Connect-Sm8Client if no config has been loaded.
     .PARAMETER Path
         Path to the .env file. Defaults to ./ .env in the current directory.
     #>
@@ -52,7 +48,7 @@ function Import-Sm8Config {
     )
 
     if (-not (Test-Path $Path)) {
-        throw "ServiceM8 config file not found at '$Path'. Copy .env.example to .env and fill in your client credentials."
+        throw "ServiceM8 config file not found at '$Path'. Copy .env.example to .env and fill in your token."
     }
 
     $config = @{}
@@ -65,8 +61,8 @@ function Import-Sm8Config {
         $config[$key] = $value
     }
 
-    if (-not $config['SERVICE_M8_CLIENT_ID'] -or -not $config['SERVICE_M8_CLIENT_SECRET']) {
-        throw "ServiceM8 config is missing SERVICE_M8_CLIENT_ID and/or SERVICE_M8_CLIENT_SECRET in '$Path'."
+    if (-not $config['SERVICE_M8_TOKEN']) {
+        throw "ServiceM8 config is missing SERVICE_M8_TOKEN in '$Path'."
     }
 
     $Script:Sm8Config = [pscustomobject]$config
@@ -95,8 +91,9 @@ function ConvertTo-Sm8TokenFile {
         $full = (Resolve-Path $Script:TokenPath).Path
         $acl = Get-Acl $full
         $acl.SetAccessRuleProtection($true, $false)
+        $identity = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).Name
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            [Environment]::CurrentUserName, 'FullControl', 'Allow')
+            $identity, 'FullControl', 'Allow')
         $acl.AddAccessRule($rule)
         try { Set-Acl $full $acl } catch { Write-Verbose "Could not tighten token file permissions: $($_.Exception.Message)" }
     }
@@ -128,9 +125,9 @@ function New-Sm8RequestHeaders {
     )
 
     [ordered]@{
-        'Authorization' = "Bearer $AccessToken"
-        'Accept'        = 'application/json'
-        'Content-Type'  = 'application/json'
+        'X-API-Key'    = $AccessToken
+        'Accept'       = 'application/json'
+        'Content-Type' = 'application/json'
     }
 }
 
@@ -150,14 +147,19 @@ function ConvertFrom-Sm8Error {
     $body = try { ($ResponseBody | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message } catch { $ResponseBody }
     $msg = "ServiceM8 API request failed ($StatusCode): $body"
     $uri = "[$Uri]"
-    $err = [System.Management.Automation.ErrorRecord]::new(
-        [System.Exception]::new($msg + " $uri"),
-        'ServiceM8ApiError',
-        [System.Management.Automation.ErrorCategory]::InvalidOperation,
-        $null)
-    if ($Inner) { $err.SetErrorRecord($Inner) }
-    $PSCmdThrow = $null
-    throw $err
+    if ($Inner -is [System.Management.Automation.ErrorRecord]) {
+        throw [System.Management.Automation.ErrorRecord]::new(
+            [System.Exception]::new($msg + " $uri"),
+            'ServiceM8ApiError',
+            [System.Management.Automation.ErrorCategory]::InvalidOperation,
+            $Inner)
+    } else {
+        throw [System.Management.Automation.ErrorRecord]::new(
+            [System.Exception]::new($msg + " $uri"),
+            'ServiceM8ApiError',
+            [System.Management.Automation.ErrorCategory]::InvalidOperation,
+            $null)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -167,167 +169,67 @@ function ConvertFrom-Sm8Error {
 function Connect-Sm8Client {
     <#
     .SYNOPSIS
-        Authenticate against ServiceM8 using the OAuth 2.0 authorization_code flow.
+        Authenticate against ServiceM8 using a single API key (X-API-Key auth).
     .DESCRIPTION
-        Requires client credentials (loaded via Import-Sm8Config or from .env).
-        Starts a local listener, opens the browser for user consent, exchanges the
-        returned code for an access/refresh token pair, and stores the tokens.
-    .PARAMETER Scopes
-        Space-separated OAuth scopes, e.g. 'read_jobs read_customers manage_jobs'.
-    .PARAMETER RedirectUri
-        Override the redirect URI (must match the registered application URI).
+        ServiceM8 issues a single API key that is sent as an "X-API-Key"
+        header on every call. This cmdlet validates that a key is available
+        (via Import-Sm8Config or .env), persists it to the local token cache,
+        and returns it. There is no OAuth flow or browser step.
     .PARAMETER Force
-        Ignore any existing token and force a fresh authentication.
+        Ignore any cached token and reload the token from configuration.
+    .EXAMPLE
+        Connect-Sm8Client
+        Loads the token from the environment and caches it locally.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [string] $Scopes,
-        [string] $RedirectUri = $Script:RedirectUri,
         [switch] $Force
     )
-
-    if ([string]::IsNullOrWhiteSpace($Scopes)) {
-        throw "Scopes must be supplied, e.g. Connect-Sm8Client -Scopes 'read_jobs read_customers'."
-    }
 
     if ($null -eq $Script:Sm8Config) { Import-Sm8Config }
     $config = $Script:Sm8Config
 
+    if ([string]::IsNullOrWhiteSpace($config.SERVICE_M8_TOKEN)) {
+        throw "No SERVICE_M8_TOKEN available. Set it in .env or via the env, then run Connect-Sm8Client."
+    }
+
+    # Reuse the cache if present and we're not forcing a reload.
     if (-not $Force -and (Test-Path -LiteralPath $Script:TokenPath)) {
-        Write-Verbose "Existing token cache found. Use -Force to re-authenticate."
-        $existing = ConvertFrom-Sm8TokenFile
-        if ($existing -and $existing.access_token) {
-            return $existing
-        }
+        Write-Verbose "Cached token found. Use -Force to reload from configuration."
+        return ConvertFrom-Sm8TokenFile
     }
 
-    if (-not $config.SERVICE_M8_CLIENT_ID -or -not $config.SERVICE_M8_CLIENT_SECRET) {
-        throw "Client credentials missing. Run Import-Sm8Config or populate .env."
+    # Build a normalised token object and persist it outside the repo.
+    $token = [pscustomobject]@{
+        api_key   = $config.SERVICE_M8_TOKEN
+        source    = 'SERVICE_M8_TOKEN'
     }
-
-    $listener = [System.Net.HttpListener]::new()
-    $listener.Prefixes.Add($RedirectUri + '/')
-    try {
-        $listener.Start()
-    } catch {
-        throw "Could not start local listener on '$RedirectUri'. Run as administrator or choose another port. ($($_.Exception.Message))"
-    }
-
-    $state = [guid]::NewGuid().ToString('N')
-
-    $params = [System.Web.HttpUtility]::UrlEncode(@{
-        response_type = 'code'
-        client_id     = $config.SERVICE_M8_CLIENT_ID
-        scope         = $Scopes
-        redirect_uri  = $RedirectUri
-        state         = $state
-    })
-
-    $authorizeUrl = "$($Script:AuthorizeUrl)?response_type=code&client_id=$([System.Web.HttpUtility]::UrlEncode($config.SERVICE_M8_CLIENT_ID))&scope=$([System.Web.HttpUtility]::UrlEncode($Scopes))&redirect_uri=$([System.Web.HttpUtility]::UrlEncode($RedirectUri))&state=$state"
-
-    Write-Verbose "Opening browser for consent."
-    Start-Process $authorizeUrl
-
-    Write-Verbose "Waiting for OAuth callback at $RedirectUri ..."
-    $ctx = $listener.GetContext()
-    $response = $ctx.Response
-    $uri = $ctx.Request.Url
-
-    # Echo back the returned state to detect tampering / mismatched requests.
-    $qs = [System.Web.HttpUtility]::ParseQueryString($uri.Query)
-    if ($qs['state'] -and $qs['state'] -ne $state) {
-        $buffer = [Text.Encoding]::UTF8.GetBytes('Error: OAuth state mismatch.')
-        $response.OutputStream.Write($buffer, 0, $buffer.Length)
-        $response.Close()
-        throw "OAuth state mismatch - request rejected."
-    }
-
-    if ($qs['error']) {
-        $buffer = [Text.Encoding]::UTF8.GetBytes("OAuth error: $($qs['error'])")
-        $response.OutputStream.Write($buffer, 0, $buffer.Length)
-        $response.Close()
-        throw "OAuth authorization rejected: $($qs['error'])"
-    }
-    if (-not $qs['code']) {
-        $buffer = [Text.Encoding]::UTF8.GetBytes('No authorization code returned.')
-        $response.OutputStream.Write($buffer, 0, $buffer.Length)
-        $response.Close()
-        throw "No authorization code returned by ServiceM8."
-    }
-    $code = $qs['code']
-
-    $buffer = [Text.Encoding]::UTF8.GetBytes('Authentication complete. You can close this window and return to PowerShell.')
-    $response.OutputStream.Write($buffer, 0, $buffer.Length)
-    $response.Close()
-
-    # Exchange the code for tokens.
-    $body = [System.Web.HttpUtility]::UrlEncode(@{
-        grant_type     = 'authorization_code'
-        client_id      = $config.SERVICE_M8_CLIENT_ID
-        client_secret  = $config.SERVICE_M8_CLIENT_SECRET
-        code           = $code
-        redirect_uri   = $RedirectUri
-    })
-
-    $token = $null
-    try {
-        $token = Invoke-RestMethod -Method Post -Uri $Script:AccessTokenUrl -ContentType 'application/x-www-form-urlencoded' -Body $body
-    } catch {
-        ConvertFrom-Sm8Error -StatusCode $_.Exception.Response.StatusCode.valueObj -ResponseBody $_.ErrorDetails.Message -Uri $Script:AccessTokenUrl -Inner $_.Record
-    }
-
-    if (-not $token.access_token) {
-        throw "Token exchange did not return an access_token."
-    }
-
     ConvertTo-Sm8TokenFile -Token $token
     Write-Verbose "Token stored at '$Script:TokenPath'."
     return $token
 }
 
 # ---------------------------------------------------------------------------
-# Token refresh
+# Token
 # ---------------------------------------------------------------------------
 
 function Get-Sm8Token {
     <#
     .SYNOPSIS
-        Return a valid access token, refreshing it if necessary.
+        Return the cached access token.
     .DESCRIPTION
-        Reads the cached token. If the access token is expired or about to expire,
-        it is refreshed using the refresh token. Returns a PSCustomObject with
-        access_token, refresh_token and expires_in.
+        Reads the cached token. With single-token auth there is no refresh
+        step - the token is used as-is until it is manually rotated. Returns a
+        PSCustomObject with api_key.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param()
 
     $token = ConvertFrom-Sm8TokenFile
-    if (-not $token -or -not $token.access_token) {
+    if (-not $token -or -not $token.api_key) {
         throw "No token available. Run Connect-Sm8Client first."
-    }
-
-    $now = [datetime]::Now
-    $expiresAt = $now.AddSeconds([int]$token.expires_in)
-    if ($now + [timespan]::FromSeconds($Script:TokenRefreshBuffer) -ge $expiresAt) {
-        if (-not $token.refresh_token) {
-            throw "Access token expired and no refresh_token is available. Run Connect-Sm8Client -Force."
-        }
-        Write-Verbose "Refreshing expired access token."
-        $body = [System.Web.HttpUtility]::UrlEncode(@{
-            grant_type    = 'refresh_token'
-            client_id     = $Script:Sm8Config.SERVICE_M8_CLIENT_ID
-            client_secret = $Script:Sm8Config.SERVICE_M8_CLIENT_SECRET
-            refresh_token = $token.refresh_token
-        })
-        try {
-            $refreshed = Invoke-RestMethod -Method Post -Uri $Script:AccessTokenUrl -ContentType 'application/x-www-form-urlencoded' -Body $body
-        } catch {
-            ConvertFrom-Sm8Error -StatusCode $_.Exception.Response.StatusCode.valueObj -ResponseBody $_.ErrorDetails.Message -Uri $Script:AccessTokenUrl -Inner $_.Record
-        }
-        ConvertTo-Sm8TokenFile -Token $refreshed
-        $token = $refreshed
     }
 
     return $token
@@ -367,12 +269,20 @@ function Invoke-Sm8Request {
     $token = Get-Sm8Token
     $uri = "$($Script:ApiRoot)/$($Path.TrimStart('/'))"
 
-    if ($Query -and $Query.Count -gt 0) {
-        $qs = [System.Web.HttpUtility]::UrlEncode($Query)
-        $uri = "$uri?$qs"
+    # Allow an absolute URL (used when following __next__ pages).
+    if ($Path -match '^https?://') {
+        $uri = $Path.TrimStart('/')
     }
 
-    $headers = New-Sm8RequestHeaders -AccessToken $token.access_token
+    if ($Query -and $Query.Count -gt 0) {
+        $qs = @()
+        foreach ($k in $Query.Keys) {
+            $qs += [System.Web.HttpUtility]::UrlEncode($k) + '=' + [System.Web.HttpUtility]::UrlEncode([string]$Query[$k])
+        }
+        $uri = $uri + '?' + ($qs -join '&')
+    }
+
+    $headers = New-Sm8RequestHeaders -AccessToken $token.api_key
 
     $invokeParams = @{
         Method      = $Method
@@ -395,20 +305,68 @@ function Invoke-Sm8Request {
     } catch {
         $status = 0
         $respBody = $null
-        if ($_.Exception.Response) {
-            $status = [int]$_.Exception.Response.StatusCode.valueObj
+
+        # Best-effort status code / body extraction across PS versions.
+        $response = $_.Exception.Response
+        if ($response) {
+            try { $status = [int]$response.StatusCode } catch { $status = 0 }
             try {
-                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                $reader.BaseStream.Position = 0
-                $respBody = $reader.ReadToEnd()
+                $stream = $response.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $reader.BaseStream.Position = 0
+                    $respBody = $reader.ReadToEnd()
+                }
             } catch { $respBody = $null }
         }
-        ConvertFrom-Sm8Error -StatusCode $status -ResponseBody $respBody -Uri $uri -Inner $_.Record
+
+        # Fallback: some errors surface the body via ErrorDetails.
+        if (-not $respBody -and $_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $respBody = $_.ErrorDetails.Message
+        }
+
+        ConvertFrom-Sm8Error -StatusCode $status -ResponseBody $respBody -Uri $uri -Inner $_
     }
 }
 
 # ---------------------------------------------------------------------------
-# Pagination
+# Record extraction (handles the response shapes the docs show)
+# ---------------------------------------------------------------------------
+
+# ServiceM8 list responses vary between shapes:
+#   { pages: [ { items: [...], _total, __next__ } ] }
+#   { data: [ {...} ], _total, __next__ }
+#   [ {...}, {...} ]
+# This normalises all of them to (records[], nextCursor, total).
+
+function Get-Sm8Records {
+    [CmdletBinding()]
+    param([object] $Response)
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    $next = $null
+    $total = $null
+
+    if ($Response -is [System.Collections.IDictionary]) {
+        $total = $Response['_total']
+        $next = $Response['__next__']
+
+        if ($Response['pages'] -and $Response['pages'][0] -is [System.Collections.IDictionary]) {
+            foreach ($item in $Response['pages'][0]['items']) { $records.Add($item) }
+        }
+        elseif ($Response['data'] -is [array]) {
+            foreach ($item in $Response['data']) { $records.Add($item) }
+        }
+    }
+    elseif ($Response -is [array]) {
+        foreach ($item in $Response) { $records.Add($item) }
+    }
+
+    return [pscustomobject]@{ Records = $records; Next = $next; Total = $total }
+}
+
+# ---------------------------------------------------------------------------
+# Pagination (shape-agnostic, follows the __next__ URL chain)
 # ---------------------------------------------------------------------------
 
 function Invoke-Sm8List {
@@ -416,10 +374,11 @@ function Invoke-Sm8List {
     .SYNOPSIS
         Retrieve every record for a listable resource, following pagination.
     .DESCRIPTION
-        ServiceM8 uses cursor-based pagination. This walks pages starting at
-        cursor -1 until the X-Next-Cursor header is empty, returning all records.
+        Handles the initial page (which may arrive as a bare array, a
+        {data:[...]} object, or a {pages:[...]} object) and then follows any
+        __next__ chain. Returns all records.
     .PARAMETER Path
-        Listable resource path, e.g. 'jobs' or 'companies'.
+        Listable resource path, e.g. 'job' (becomes '/job.json').
     .PARAMETER Query
         Additional query parameters (e.g. filters) merged into each page request.
     #>
@@ -431,38 +390,102 @@ function Invoke-Sm8List {
     )
 
     $all = [System.Collections.Generic.List[object]]::new()
-    $cursor = '-1'
-    $page = 0
 
-    do {
-        $page++
-        $pageQuery = [hashtable]::Synchronized(@{})
-        if ($Query) { foreach ($k in $Query.Keys) { $pageQuery[$k] = $Query[$k] } }
-        $pageQuery['_next-cursor'] = $cursor
+    # First page: may be a bare array, {data:[...]}, or {pages:[...]}.
+    $result = Invoke-Sm8Request -Path $Path -Method GET -Query $Query
+    $extracted = Get-Sm8Records -Response $result
+    foreach ($r in $extracted.Records) { $all.Add($r) }
+    $next = $extracted.Next
 
-        $result = Invoke-Sm8Request -Path $Path -Method GET -Query $pageQuery
-
-        $records = $null
-        if ($result -is [System.Collections.IDictionary]) {
-            foreach ($key in $result.Keys) { $records = $result[$key]; break }
-        } elseif ($result -is [array]) {
-            $records = $result
-        } else {
-            $records = @($result)
-        }
-
-        if ($records) { $all.AddRange($records) }
-
-        $cursor = if ($result -is [System.Collections.IDictionary] -and $result.ContainsKey('_next-cursor')) {
-            $result['_next-cursor']
-        } else {
-            $null
-        }
-    } while ($cursor)
+    # Follow any further pages via the __next__ chain.
+    while ($null -ne $next) {
+        $result = Invoke-Sm8Request -Path $next -Method GET
+        $extracted = Get-Sm8Records -Response $result
+        foreach ($r in $extracted.Records) { $all.Add($r) }
+        $next = $extracted.Next
+    }
 
     if ($all.Count -eq 0) { return @() }
     if ($all.Count -eq 1) { return $all[0] }
     return ,$all.ToArray()
+}
+
+# ---------------------------------------------------------------------------
+# Generic CRUD (single entry point, driven by the registry)
+# ---------------------------------------------------------------------------
+
+function Invoke-Sm8Resource {
+    <#
+    .SYNOPSIS
+        Perform CRUD against any registered ServiceM8 resource.
+    .DESCRIPTION
+        The single portable entry point over the API. Given a resource name from
+        the registry (e.g. 'Job', 'Company', 'Attachment') and a verb (Get,
+        Post, Update, Delete), it builds the correct endpoint and makes the call.
+        This is the function most likely to be ported to another language.
+    .PARAMETER Resource
+        Resource name from Get-Sm8Registry, e.g. 'Job'.
+    .PARAMETER Verb
+        Get (list or retrieve), Post (create), Update, or Delete.
+    .PARAMETER Uuid
+        Record UUID. Required for Get/Update/Delete by single record.
+    .PARAMETER Body
+        Record fields for Post/Update (object or JSON string).
+    .PARAMETER All
+        For Get: paginate and return every record.
+    .PARAMETER Query
+        Extra query parameters (filters, etc.).
+    .EXAMPLE
+        Invoke-Sm8Resource -Resource Job -Verb Get -All
+    .EXAMPLE
+        Invoke-Sm8Resource -Resource Job -Verb Post -Body @{ date = '2026-09-09' }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)] [string] $Resource,
+        [ValidateSet('Get', 'Post', 'Update', 'Delete')] [string] $Verb,
+        [string] $Uuid,
+        [object] $Body,
+        [switch] $All,
+        [hashtable] $Query
+    )
+
+    $reg = Get-Sm8Registry | Where-Object { $_.Name -eq $Resource }
+    if (-not $reg) { throw "Unknown resource '$Resource'. Run Get-Sm8Registry to list resources." }
+
+    # Scope enforcement (warn if caller's auth is likely insufficient).
+    $scope = switch ($Verb) {
+        'Get'     { $reg.ReadScope }
+        'Post'    { $reg.WriteScope }
+        'Update'  { $reg.DeleteScope }
+        'Delete'  { $reg.DeleteScope }
+    }
+
+    $path = $reg.Path
+    switch ($Verb) {
+        'Get' {
+            if ($Uuid) {
+                return Invoke-Sm8Request -Path "$path/$Uuid.json" -Method GET -Query $Query
+            }
+            if ($All) { return Invoke-Sm8List -Path $path -Query $Query }
+            return Invoke-Sm8Request -Path "$path.json" -Method GET -Query $Query
+        }
+        'Post' {
+            if ($Uuid) {
+                return Invoke-Sm8Request -Path "$path/$Uuid.json" -Method POST -Body $Body
+            }
+            return Invoke-Sm8Request -Path "$path.json" -Method POST -Body $Body
+        }
+        'Update' {
+            if (-not $Uuid) { throw "Update requires -Uuid." }
+            return Invoke-Sm8Request -Path "$path/$Uuid.json" -Method POST -Body $Body
+        }
+        'Delete' {
+            if (-not $Uuid) { throw "Delete requires -Uuid." }
+            return Invoke-Sm8Request -Path "$path/$Uuid.json" -Method DELETE
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -484,4 +507,4 @@ function Get-Sm8ResourceRoot {
 }
 
 Export-ModuleMember -Function Import-Sm8Config, Connect-Sm8Client, Get-Sm8Token,
-    Invoke-Sm8Request, Invoke-Sm8List, Get-Sm8ResourceRoot
+    Invoke-Sm8Request, Invoke-Sm8List, Invoke-Sm8Resource, Get-Sm8ResourceRoot
